@@ -344,65 +344,29 @@ func (e *exchange) makeAuctionContext(ctx context.Context, needsCache bool) (auc
 }
 
 // This piece sends all the requests to the bidder adapters and gathers the results.
-func (e *exchange) getAllBids(ctx context.Context, cleanRequests map[openrtb_ext.BidderName]*openrtb.BidRequest, aliases map[string]string, bidAdjustments map[string]float64, blabels map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels, conversions currencies.Conversions) (map[openrtb_ext.BidderName]*pbsOrtbSeatBid, map[openrtb_ext.BidderName]*seatResponseExtra, bool) {
+func (e *exchange) getAllBids(
+	ctx context.Context, // http client. we need this.
+	cleanRequests map[openrtb_ext.BidderName]*openrtb.BidRequest, // definitely need these
+	aliases map[string]string, // 1 use
+	bidAdjustments map[string]float64, // 1 use
+	blabels map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels, // need this.. maybe?
+	conversions currencies.Conversions) (map[openrtb_ext.BidderName]*pbsOrtbSeatBid, map[openrtb_ext.BidderName]*seatResponseExtra, bool) {
 	// Set up pointers to the bid results
 	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid, len(cleanRequests))
 	adapterExtra := make(map[openrtb_ext.BidderName]*seatResponseExtra, len(cleanRequests))
 	chBids := make(chan *bidResponseWrapper, len(cleanRequests))
 	bidsFound := false
 
-	for bidderName, req := range cleanRequests {
-		// Here we actually call the adapters and collect the bids.
+	for bidderName, request := range cleanRequests {
 		coreBidder := resolveBidder(string(bidderName), aliases)
-		bidderRunner := e.recoverSafely(cleanRequests, func(aName openrtb_ext.BidderName, coreBidder openrtb_ext.BidderName, request *openrtb.BidRequest, bidlabels *pbsmetrics.AdapterLabels, conversions currencies.Conversions) {
+
 			// Passing in aName so a doesn't change out from under the go routine
-			if bidlabels.Adapter == "" {
-				glog.Errorf("Exchange: bidlables for %s (%s) missing adapter string", aName, coreBidder)
-				bidlabels.Adapter = coreBidder
-			}
-			brw := new(bidResponseWrapper)
-			brw.bidder = aName
-			// Defer basic metrics to insure we capture them after all the values have been set
-			defer func() {
-				e.me.RecordAdapterRequest(*bidlabels)
-			}()
-			start := time.Now()
+	if bidlabels.Adapter == "" {
+		glog.Errorf("Exchange: bidlables for %s (%s) missing adapter string", aName, coreBidder)
+		bidlabels.Adapter = coreBidder
+	}
 
-			adjustmentFactor := 1.0
-			if givenAdjustment, ok := bidAdjustments[string(aName)]; ok {
-				adjustmentFactor = givenAdjustment
-			}
-			var reqInfo adapters.ExtraRequestInfo
-			reqInfo.PbsEntryPoint = bidlabels.RType
-			bids, err := e.adapterMap[coreBidder].requestBid(ctx, request, aName, adjustmentFactor, conversions, &reqInfo)
-
-			// Add in time reporting
-			elapsed := time.Since(start)
-			brw.adapterBids = bids
-			// Structure to record extra tracking data generated during bidding
-			ae := new(seatResponseExtra)
-			ae.ResponseTimeMillis = int(elapsed / time.Millisecond)
-			if bids != nil {
-				ae.HttpCalls = bids.httpCalls
-			}
-
-			// Timing statistics
-			e.me.RecordAdapterTime(*bidlabels, time.Since(start))
-			serr := errsToBidderErrors(err)
-			bidlabels.AdapterBids = bidsToMetric(brw.adapterBids)
-			bidlabels.AdapterErrors = errorsToMetric(err)
-			// Append any bid validation errors to the error list
-			ae.Errors = serr
-			brw.adapterExtra = ae
-			if bids != nil {
-				for _, bid := range bids.bids {
-					var cpm = float64(bid.bid.Price * 1000)
-					e.me.RecordAdapterPrice(*bidlabels, cpm)
-					e.me.RecordAdapterBidReceived(*bidlabels, bid.bidType, bid.bid.AdM != "")
-				}
-			}
-			chBids <- brw
-		}, chBids)
+		bidderRunner := e.recoverSafely(cleanRequests, doBid, chBids)
 		go bidderRunner(bidderName, coreBidder, req, blabels[coreBidder], conversions)
 	}
 	// Wait for the bidders to do their thing
@@ -422,6 +386,68 @@ func (e *exchange) getAllBids(ctx context.Context, cleanRequests map[openrtb_ext
 	}
 
 	return adapterBids, adapterExtra, bidsFound
+}
+
+type runBid func()
+
+func (e *exchange) idealBid(r requestBidWrapper) {  //runBidder runBid, request *openrtb.BidRequest, bidlabels *pbsmetrics.AdapterLabels) *bidResponseWrapper {
+
+
+type requestBidWrapper struct {
+	bidder adaptedBidder
+	ctx context.Context
+	 request *openrtb.BidRequest
+	 name openrtb_ext.BidderName
+	  bidAdjustment float64
+	  conversions currencies.Conversions
+	   reqInfo *adapters.ExtraRequestInfo
+}
+
+func (e requestBidWrapper) requestBid() {
+}
+
+	brw := new(bidResponseWrapper)
+	brw.bidder = aName
+	// Defer basic metrics to insure we capture them after all the values have been set
+	defer func() {
+		e.me.RecordAdapterRequest(*bidlabels)
+	}()
+	start := time.Now()
+
+	adjustmentFactor := 1.0
+	if givenAdjustment, ok := bidAdjustments[string(aName)]; ok {
+		adjustmentFactor = givenAdjustment
+	}
+	var reqInfo adapters.ExtraRequestInfo
+	reqInfo.PbsEntryPoint = bidlabels.RType
+	bids, err := r.requestBid()
+
+	// Add in time reporting
+	elapsed := time.Since(start)
+	brw.adapterBids = bids
+	// Structure to record extra tracking data generated during bidding
+	ae := new(seatResponseExtra)
+	ae.ResponseTimeMillis = int(elapsed / time.Millisecond)
+	if bids != nil {
+		ae.HttpCalls = bids.httpCalls
+	}
+
+	// Timing statistics
+	e.me.RecordAdapterTime(*bidlabels, time.Since(start))
+	serr := errsToBidderErrors(err)
+	bidlabels.AdapterBids = bidsToMetric(brw.adapterBids)
+	bidlabels.AdapterErrors = errorsToMetric(err)
+	// Append any bid validation errors to the error list
+	ae.Errors = serr
+	brw.adapterExtra = ae
+	if bids != nil {
+		for _, bid := range bids.bids {
+			var cpm = float64(bid.bid.Price * 1000)
+			e.me.RecordAdapterPrice(*bidlabels, cpm)
+			e.me.RecordAdapterBidReceived(*bidlabels, bid.bidType, bid.bid.AdM != "")
+		}
+	}
+	return brw
 }
 
 func (e *exchange) recoverSafely(cleanRequests map[openrtb_ext.BidderName]*openrtb.BidRequest, inner func(openrtb_ext.BidderName, openrtb_ext.BidderName, *openrtb.BidRequest, *pbsmetrics.AdapterLabels, currencies.Conversions), chBids chan *bidResponseWrapper) func(openrtb_ext.BidderName, openrtb_ext.BidderName, *openrtb.BidRequest, *pbsmetrics.AdapterLabels, currencies.Conversions) {
